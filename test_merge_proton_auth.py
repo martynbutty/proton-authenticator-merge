@@ -12,7 +12,9 @@ import os
 
 from merge_proton_auth import (
     discover_json_files, is_valid_export, validate_export_files,
-    parse_entries, deduplicate, has_note, write_output, print_report, main, OUTPUT_FILENAME
+    parse_entries, deduplicate, has_note, write_output, write_single_entry_files,
+    print_report, main, OUTPUT_FILENAME,
+    identify_unique_entries, generate_unique_filenames, count_existing_unique_files,
 )
 
 
@@ -416,7 +418,7 @@ class TestReportingAccuracy:
     files_processed == F, total_entries == T, unique_entries == U,
     duplicates_resolved == T - U.
 
-    Validates: Requirements 8.1, 8.2, 8.3, 8.4
+    Validates: Requirements 8.1, 8.2, 8.3, 8.4, 6.1, 6.2, 6.3
     """
 
     @given(
@@ -433,7 +435,7 @@ class TestReportingAccuracy:
         old_stdout = sys.stdout
         sys.stdout = captured
         try:
-            print_report(num_files, total_entries, unique_entries)
+            print_report(num_files, total_entries, unique_entries, [])
         finally:
             sys.stdout = old_stdout
 
@@ -458,12 +460,43 @@ class TestReportingAccuracy:
         old_stdout = sys.stdout
         sys.stdout = captured
         try:
-            print_report(num_files, total_entries, unique_entries)
+            print_report(num_files, total_entries, unique_entries, [])
         finally:
             sys.stdout = old_stdout
 
         output = captured.getvalue()
         assert f"Duplicates resolved: {duplicate_count}" in output
+
+    def test_single_entry_filenames_printed(self):
+        """When single_entry_filenames is non-empty, each filename is printed with count."""
+        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_other_C.json"]
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            print_report(2, 10, 8, filenames)
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+        assert "Single-entry files created (3):" in output
+        assert "  - unique_src_A.json" in output
+        assert "  - unique_src_B.json" in output
+        assert "  - unique_other_C.json" in output
+
+    def test_no_single_entry_files_message(self):
+        """When single_entry_filenames is empty, prints 'no single-entry files needed'."""
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            print_report(2, 10, 10, [])
+        finally:
+            sys.stdout = old_stdout
+
+        output = captured.getvalue()
+        assert "No single-entry files needed (all entries shared across files)." in output
 
 
 
@@ -474,9 +507,11 @@ class TestIntegration:
     """
 
     def setup_example_dir(self, tmp_path):
-        """Copy example files to a temp directory."""
+        """Copy example files to a temp directory, excluding output file."""
         examples_dir = Path(__file__).parent / "examples"
         for f in examples_dir.glob("*.json"):
+            if f.name == OUTPUT_FILENAME:
+                continue
             shutil.copy(f, tmp_path / f.name)
         return tmp_path
 
@@ -718,3 +753,387 @@ class TestUserDeclineCleanExit:
 
             assert result == 0
             assert not (tmp_path / OUTPUT_FILENAME).exists()
+
+
+class TestIdentifyUniqueEntries:
+    """Unit tests for identify_unique_entries function.
+
+    Validates: Requirements 1.1, 1.2, 1.3
+    """
+
+    def test_basic_unique_identification(self):
+        """Entries appearing in only one file are identified as unique."""
+        entries = [
+            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+            ("file1.json", {"id": "bbb", "content": {"uri": "y"}, "note": None}),
+            ("file2.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+            ("file2.json", {"id": "ccc", "content": {"uri": "z"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        # aaa is in both files - not unique
+        # bbb is only in file1 - unique
+        # ccc is only in file2 - unique
+        assert len(result) == 2
+        assert result[0] == ("file1.json", {"id": "bbb", "content": {"uri": "y"}, "note": None})
+        assert result[1] == ("file2.json", {"id": "ccc", "content": {"uri": "z"}, "note": None})
+
+    def test_same_id_twice_in_one_file_still_unique(self):
+        """An ID appearing twice in the same file is still unique to that file."""
+        entries = [
+            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+            ("file1.json", {"id": "aaa", "content": {"uri": "y"}, "note": "dup"}),
+            ("file2.json", {"id": "bbb", "content": {"uri": "z"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        # aaa appears only in file1 (twice) - still unique to one file
+        # bbb appears only in file2 - unique
+        assert len(result) == 2
+        # Should keep first occurrence per file
+        assert result[0][0] == "file1.json"
+        assert result[0][1]["id"] == "aaa"
+        assert result[0][1]["content"]["uri"] == "x"  # first occurrence
+        assert result[1] == ("file2.json", {"id": "bbb", "content": {"uri": "z"}, "note": None})
+
+    def test_no_unique_entries(self):
+        """When all entries are shared across files, result is empty."""
+        entries = [
+            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+            ("file2.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        assert len(result) == 0
+
+    def test_empty_entries(self):
+        """Empty input returns empty result."""
+        result = identify_unique_entries([])
+        assert len(result) == 0
+
+    def test_all_unique_entries(self):
+        """When no entries are shared, all are unique."""
+        entries = [
+            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
+            ("file2.json", {"id": "bbb", "content": {"uri": "y"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        assert len(result) == 2
+
+    def test_sorting_by_source_filename_then_entry_id(self):
+        """Results are sorted by (source_filename, entry_id)."""
+        entries = [
+            ("z_file.json", {"id": "zzz", "content": {"uri": "a"}, "note": None}),
+            ("a_file.json", {"id": "mmm", "content": {"uri": "b"}, "note": None}),
+            ("a_file.json", {"id": "aaa", "content": {"uri": "c"}, "note": None}),
+            ("z_file.json", {"id": "aaa_z", "content": {"uri": "d"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        assert len(result) == 4
+        # Sorted by filename first, then entry_id
+        assert result[0] == ("a_file.json", {"id": "aaa", "content": {"uri": "c"}, "note": None})
+        assert result[1] == ("a_file.json", {"id": "mmm", "content": {"uri": "b"}, "note": None})
+        assert result[2] == ("z_file.json", {"id": "aaa_z", "content": {"uri": "d"}, "note": None})
+        assert result[3] == ("z_file.json", {"id": "zzz", "content": {"uri": "a"}, "note": None})
+
+    def test_correct_source_file_association(self):
+        """Each unique entry is associated with the correct source file."""
+        entries = [
+            ("mobile.json", {"id": "mob-only", "content": {"uri": "m"}, "note": None}),
+            ("mobile.json", {"id": "shared", "content": {"uri": "m"}, "note": None}),
+            ("desktop.json", {"id": "desk-only", "content": {"uri": "d"}, "note": None}),
+            ("desktop.json", {"id": "shared", "content": {"uri": "d"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        assert len(result) == 2
+        # Sorted by filename: desktop before mobile
+        assert result[0] == ("desktop.json", {"id": "desk-only", "content": {"uri": "d"}, "note": None})
+        assert result[1] == ("mobile.json", {"id": "mob-only", "content": {"uri": "m"}, "note": None})
+
+    def test_three_files_unique_in_one(self):
+        """Entry in exactly one of three files is unique."""
+        entries = [
+            ("file1.json", {"id": "a", "content": {"uri": "x"}, "note": None}),
+            ("file1.json", {"id": "shared12", "content": {"uri": "x"}, "note": None}),
+            ("file2.json", {"id": "shared12", "content": {"uri": "x"}, "note": None}),
+            ("file2.json", {"id": "shared23", "content": {"uri": "x"}, "note": None}),
+            ("file3.json", {"id": "shared23", "content": {"uri": "x"}, "note": None}),
+            ("file3.json", {"id": "c", "content": {"uri": "x"}, "note": None}),
+        ]
+        result = identify_unique_entries(entries)
+        # "a" only in file1, "c" only in file3
+        # shared12 in file1+file2, shared23 in file2+file3
+        assert len(result) == 2
+        assert result[0][1]["id"] == "a"
+        assert result[0][0] == "file1.json"
+        assert result[1][1]["id"] == "c"
+        assert result[1][0] == "file3.json"
+
+
+class TestGenerateUniqueFilenames:
+    """Unit tests for generate_unique_filenames function.
+
+    Validates: Requirements 3.1, 3.7
+    """
+
+    def test_basic_filename_generation(self):
+        """Generates filenames using template unique_<source_stem>_<descriptive>.json."""
+        entries = [
+            ("mobile-backup.json", {"id": "aaa", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "entry_type": "Totp", "name": "test"}, "note": "My AWS"}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert len(result) == 1
+        source, entry, filename = result[0]
+        assert source == "mobile-backup.json"
+        assert entry["id"] == "aaa"
+        assert filename == "unique_mobile-backup_My_AWS.json"
+
+    def test_uses_note_for_descriptive(self):
+        """When entry has a note, uses it as the descriptive portion."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=GitHub", "entry_type": "Totp", "name": "fallback"}, "note": "Work Account"}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert result[0][2] == "unique_src_Work_Account.json"
+
+    def test_uses_issuer_when_no_note(self):
+        """When entry has no note, falls back to issuer from URI."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "entry_type": "Totp", "name": "fallback"}, "note": None}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert result[0][2] == "unique_src_Google.json"
+
+    def test_uses_content_name_when_no_note_or_issuer(self):
+        """When entry has no note and no issuer, falls back to content.name."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "myaccount"}, "note": None}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert result[0][2] == "unique_src_myaccount.json"
+
+    def test_collision_resolution_with_suffix(self):
+        """Duplicate filenames get numeric suffixes _2, _3 etc."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+            ("src.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert result[0][2] == "unique_src_Same.json"
+        assert result[1][2] == "unique_src_Same_2.json"
+        assert result[2][2] == "unique_src_Same_3.json"
+
+    def test_no_collision_different_sources(self):
+        """Entries from different source files with same descriptive get different stems."""
+        entries = [
+            ("file1.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+            ("file2.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+        ]
+        result = generate_unique_filenames(entries)
+        # Different source stems mean different base names, no collision
+        assert result[0][2] == "unique_file1_Same.json"
+        assert result[1][2] == "unique_file2_Same.json"
+
+    def test_empty_input(self):
+        """Empty input returns empty result."""
+        result = generate_unique_filenames([])
+        assert result == []
+
+    def test_sanitisation_applied(self):
+        """Unsafe characters in descriptive portion are replaced with underscores."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "My Account/Work"}),
+        ]
+        result = generate_unique_filenames(entries)
+        assert result[0][2] == "unique_src_My_Account_Work.json"
+
+    def test_all_filenames_unique(self):
+        """All generated filenames in the result are unique."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "X"}),
+            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "X"}),
+            ("src.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "test"}, "note": "X"}),
+            ("src.json", {"id": "d", "content": {"uri": "w", "entry_type": "Totp", "name": "test"}, "note": "X"}),
+        ]
+        result = generate_unique_filenames(entries)
+        filenames = [fname for _, _, fname in result]
+        assert len(filenames) == len(set(filenames))
+
+    def test_preserves_entry_data(self):
+        """Result triples preserve the original entry data unchanged."""
+        entry = {"id": "abc-123", "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "myname"}, "note": "mynote"}
+        entries = [("source.json", entry)]
+        result = generate_unique_filenames(entries)
+        assert result[0][0] == "source.json"
+        assert result[0][1] is entry  # Same reference
+
+
+class TestCountExistingUniqueFiles:
+    """Unit tests for count_existing_unique_files function.
+
+    Validates: Requirements 8.1, 8.2
+    """
+
+    def test_no_existing_files(self, tmp_path):
+        """Returns 0 when none of the filenames exist."""
+        filenames = ["unique_src_A.json", "unique_src_B.json"]
+        assert count_existing_unique_files(tmp_path, filenames) == 0
+
+    def test_all_existing_files(self, tmp_path):
+        """Returns count equal to list length when all files exist."""
+        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_src_C.json"]
+        for name in filenames:
+            (tmp_path / name).write_text("{}", encoding="utf-8")
+        assert count_existing_unique_files(tmp_path, filenames) == 3
+
+    def test_some_existing_files(self, tmp_path):
+        """Returns correct count when only some files exist."""
+        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_src_C.json"]
+        (tmp_path / "unique_src_A.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "unique_src_C.json").write_text("{}", encoding="utf-8")
+        assert count_existing_unique_files(tmp_path, filenames) == 2
+
+    def test_empty_filenames_list(self, tmp_path):
+        """Returns 0 when filenames list is empty."""
+        assert count_existing_unique_files(tmp_path, []) == 0
+
+    def test_ignores_other_files_in_directory(self, tmp_path):
+        """Only counts files from the provided list, not all directory contents."""
+        # Create files that aren't in the list
+        (tmp_path / "other.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "another.json").write_text("{}", encoding="utf-8")
+        filenames = ["unique_src_A.json"]
+        assert count_existing_unique_files(tmp_path, filenames) == 0
+
+
+class TestWriteSingleEntryFiles:
+    """Unit tests for write_single_entry_files function.
+
+    Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5
+    """
+
+    def test_writes_single_entry_file(self, tmp_path):
+        """Writes a valid Proton Authenticator export with one entry."""
+        entry = {
+            "id": "abc-123",
+            "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "test"},
+            "note": "My Note"
+        }
+        file_entries = [("source.json", entry, "unique_source_My_Note.json")]
+
+        result = write_single_entry_files(tmp_path, file_entries)
+
+        assert result == ["unique_source_My_Note.json"]
+        output_path = tmp_path / "unique_source_My_Note.json"
+        assert output_path.exists()
+
+        content = output_path.read_text(encoding="utf-8")
+        data = json_module.loads(content)
+        assert data["version"] == 1
+        assert len(data["entries"]) == 1
+        assert data["entries"][0] == entry
+
+    def test_uses_4_space_indentation(self, tmp_path):
+        """Output uses 4-space indentation."""
+        entry = {
+            "id": "abc-123",
+            "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "test"},
+            "note": None
+        }
+        file_entries = [("source.json", entry, "unique_source_test.json")]
+
+        write_single_entry_files(tmp_path, file_entries)
+
+        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
+        lines = content.split("\n")
+        for line in lines:
+            stripped = line.lstrip(" ")
+            if stripped and line != stripped:
+                indent = len(line) - len(stripped)
+                assert indent % 4 == 0, f"Non-4-space indent found: {indent} spaces"
+
+    def test_trailing_newline(self, tmp_path):
+        """Output ends with a trailing newline."""
+        entry = {
+            "id": "abc-123",
+            "content": {"uri": "x", "entry_type": "Totp", "name": "test"},
+            "note": None
+        }
+        file_entries = [("source.json", entry, "unique_source_test.json")]
+
+        write_single_entry_files(tmp_path, file_entries)
+
+        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
+        assert content.endswith("\n")
+
+    def test_utf8_encoding(self, tmp_path):
+        """Output is written in UTF-8 encoding with non-ASCII characters preserved."""
+        entry = {
+            "id": "abc-123",
+            "content": {"uri": "x", "entry_type": "Totp", "name": "tëst-émojis-日本語"},
+            "note": "Ünïcödé nötë"
+        }
+        file_entries = [("source.json", entry, "unique_source_test.json")]
+
+        write_single_entry_files(tmp_path, file_entries)
+
+        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
+        data = json_module.loads(content)
+        assert data["entries"][0]["note"] == "Ünïcödé nötë"
+        assert data["entries"][0]["content"]["name"] == "tëst-émojis-日本語"
+        # ensure_ascii=False means non-ASCII chars are preserved literally
+        assert "Ünïcödé" in content
+        assert "日本語" in content
+
+    def test_multiple_entries(self, tmp_path):
+        """Writes multiple single-entry files and returns all filenames."""
+        entries = [
+            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "one"}, "note": None}, "unique_src_one.json"),
+            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "two"}, "note": None}, "unique_src_two.json"),
+            ("other.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "three"}, "note": None}, "unique_other_three.json"),
+        ]
+
+        result = write_single_entry_files(tmp_path, entries)
+
+        assert result == ["unique_src_one.json", "unique_src_two.json", "unique_other_three.json"]
+        for _, _, filename in entries:
+            assert (tmp_path / filename).exists()
+
+    def test_empty_input_returns_empty_list(self, tmp_path):
+        """Empty input produces no files and returns empty list."""
+        result = write_single_entry_files(tmp_path, [])
+        assert result == []
+
+    def test_overwrites_existing_file(self, tmp_path):
+        """Overwrites an existing file with the same name."""
+        # Create existing file with different content
+        (tmp_path / "unique_src_test.json").write_text('{"old": "data"}', encoding="utf-8")
+
+        entry = {
+            "id": "new-id",
+            "content": {"uri": "x", "entry_type": "Totp", "name": "test"},
+            "note": None
+        }
+        file_entries = [("src.json", entry, "unique_src_test.json")]
+
+        write_single_entry_files(tmp_path, file_entries)
+
+        data = json_module.loads((tmp_path / "unique_src_test.json").read_text(encoding="utf-8"))
+        assert data["version"] == 1
+        assert data["entries"][0]["id"] == "new-id"
+
+    def test_entry_data_preserved_exactly(self, tmp_path):
+        """Entry data (id, content, note) is preserved unchanged in the output file."""
+        entry = {
+            "id": "a7e1d804-7e24-4db2-9508-b3eb301f123b",
+            "content": {
+                "uri": "otpauth://totp/mattermost%3Amartyn?secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30&issuer=mattermost",
+                "entry_type": "Totp",
+                "name": "martyn"
+            },
+            "note": None
+        }
+        file_entries = [("mobile.json", entry, "unique_mobile_mattermost.json")]
+
+        write_single_entry_files(tmp_path, file_entries)
+
+        data = json_module.loads((tmp_path / "unique_mobile_mattermost.json").read_text(encoding="utf-8"))
+        assert data["entries"][0] == entry
