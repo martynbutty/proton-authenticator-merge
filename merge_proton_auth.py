@@ -119,6 +119,7 @@ def confirm_merge(
     total_entries: int,
     unique_entries: int,
     output_exists: bool,
+    entries_per_file: Dict[str, int],
 ) -> bool:
     """Display merge summary and prompt for confirmation. Returns True to proceed."""
     duplicates = total_entries - unique_entries
@@ -127,7 +128,8 @@ def confirm_merge(
     print("\n--- Merge Summary ---")
     print(f"Input files ({len(files)}):")
     for f in files:
-        print(f"  - {f.name}")
+        count = entries_per_file.get(f.name, 0)
+        print(f"  - {f.name} ({count} entries)")
     print(f"Total entries found: {total_entries}")
     print(f"Duplicates detected: {duplicates}")
     print(f"Unique entries to write: {unique_entries}")
@@ -194,11 +196,16 @@ def main() -> int:
     # Entry parsing
     all_entries = parse_entries(valid_files)
 
+    # Count entries per file for summary display
+    entries_per_file: Dict[str, int] = {}
+    for filename, _ in all_entries:
+        entries_per_file[filename] = entries_per_file.get(filename, 0) + 1
+
     # Deduplication
     unique_entries = deduplicate(all_entries)
 
     # Confirmation prompt
-    if not confirm_merge(valid_files, len(all_entries), len(unique_entries), output_exists):
+    if not confirm_merge(valid_files, len(all_entries), len(unique_entries), output_exists, entries_per_file):
         print("No files were written.")
         return 0
 
