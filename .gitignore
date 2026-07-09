@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+
+# Example export files (contain sensitive TOTP secrets)
+examples/
+
+# Kiro IDE config and specs
+.kiro/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Hypothesis test database
+.hypothesis/
+
+# Pytest cache
+.pytest_cache/
+
+# Merged output (generated file)
+merged_proton_auth.json
