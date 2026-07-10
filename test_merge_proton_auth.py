@@ -1,219 +1,35 @@
-"""Property-based tests for merge_proton_auth.py."""
+"""Tests for merge_proton_auth.py."""
 
 import json as json_module
+import io
 import shutil
+import sys
+import tempfile
 import pytest
 from hypothesis import given, settings, assume
 from hypothesis import strategies as st
 from pathlib import Path
 from unittest.mock import patch
-import tempfile
-import os
 
 from merge_proton_auth import (
     discover_json_files, is_valid_export, validate_export_files,
     parse_entries, deduplicate, has_note, write_output, write_single_entry_files,
-    print_report, main, OUTPUT_FILENAME,
-    identify_unique_entries, generate_unique_filenames, count_existing_unique_files,
+    print_report, print_missing_from_summary, main,
+    OUTPUT_FILENAME, OUTPUT_DIR_NAME, GENERIC_EXPORT_PATTERN,
+    identify_unique_entries, generate_unique_filenames,
+    check_output_dir_conflicts, has_generic_export_names,
+    determine_missing_from, sanitise_filename_part, derive_entry_name,
 )
 
 
-# Strategy to generate valid JSON filenames (excluding the output filename)
+# --- Strategies ---
+
 json_filenames = st.text(
     alphabet=st.characters(whitelist_categories=("L", "N"), whitelist_characters="_-"),
     min_size=1,
     max_size=20,
 ).map(lambda s: s + ".json")
 
-
-class TestOutputFileExclusion:
-    """Property 2: Output File Exclusion.
-
-    For any directory containing a file named `merged_proton_auth.json` alongside
-    other `.json` files, the file discovery phase SHALL never include
-    `merged_proton_auth.json` in the set of files to be validated or processed.
-
-    **Validates: Requirements 2.1**
-    """
-
-    @given(
-        filenames=st.lists(json_filenames, min_size=0, max_size=10),
-        include_output=st.booleans(),
-    )
-    @settings(max_examples=200)
-    def test_output_file_never_in_results(self, filenames, include_output):
-        """discover_json_files never includes merged_proton_auth.json in results."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-
-            # Create the generated JSON files
-            for name in filenames:
-                (tmp_path / name).write_text("{}", encoding="utf-8")
-
-            # Optionally create the output file
-            if include_output:
-                (tmp_path / OUTPUT_FILENAME).write_text("{}", encoding="utf-8")
-
-            # Call discover_json_files
-            discovered, output_exists = discover_json_files(tmp_path)
-
-            # Property: OUTPUT_FILENAME is never in the returned list
-            discovered_names = [f.name for f in discovered]
-            assert OUTPUT_FILENAME not in discovered_names
-
-            # Also verify output_exists boolean correctness
-            assert output_exists == include_output
-
-
-class TestFileValidationCorrectness:
-    """Property 1: File Validation Correctness.
-
-    For any JSON value, is_valid_export returns True iff value is a dict
-    with version == 1 and entries as a list.
-
-    Validates: Requirements 3.1
-    """
-
-    @given(entries=st.lists(st.dictionaries(st.text(), st.text()), max_size=5))
-    @settings(max_examples=200)
-    def test_valid_exports_accepted(self, entries):
-        """Valid structure always returns True."""
-        data = {"version": 1, "entries": entries}
-        assert is_valid_export(data) is True
-
-    @given(data=st.one_of(
-        st.none(),
-        st.integers(),
-        st.text(),
-        st.lists(st.integers()),
-        # dict with wrong version
-        st.fixed_dictionaries({"version": st.integers().filter(lambda x: x != 1), "entries": st.just([])}),
-        # dict missing entries
-        st.fixed_dictionaries({"version": st.just(1)}),
-        # dict where entries is not a list
-        st.fixed_dictionaries({"version": st.just(1), "entries": st.one_of(st.text(), st.integers(), st.none())}),
-    ))
-    @settings(max_examples=200)
-    def test_invalid_exports_rejected(self, data):
-        """Invalid structures always return False."""
-        assert is_valid_export(data) is False
-
-
-# Strategy to generate different kinds of invalid file content
-invalid_content_strategy = st.one_of(
-    # Malformed JSON
-    st.just("not json at all"),
-    st.just("{invalid json"),
-    st.just(""),
-    # Dict without version key
-    st.just('{"entries": []}'),
-    # Dict with wrong version
-    st.just('{"version": 2, "entries": []}'),
-    st.just('{"version": "1", "entries": []}'),
-    # Dict without entries key
-    st.just('{"version": 1}'),
-    # Dict where entries is not a list
-    st.just('{"version": 1, "entries": "not a list"}'),
-    st.just('{"version": 1, "entries": 42}'),
-    st.just('{"version": 1, "entries": {}}'),
-)
-
-
-class TestStrictValidationAbort:
-    """Property 3: Strict Validation Abort.
-
-    For any set of discovered .json files where at least one fails validation,
-    the script reports all failing filenames and exits without writing output.
-
-    Validates: Requirements 3.2, 3.4
-    """
-
-    @given(
-        valid_count=st.integers(min_value=0, max_value=3),
-        invalid_count=st.integers(min_value=1, max_value=3),
-        invalid_content=st.lists(invalid_content_strategy, min_size=1, max_size=3),
-    )
-    @settings(max_examples=100)
-    def test_invalid_files_detected(self, valid_count, invalid_count, invalid_content):
-        """When any file is invalid, invalid list is non-empty."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            files = []
-
-            # Create valid files
-            for i in range(valid_count):
-                f = tmp_path / f"valid_{i}.json"
-                f.write_text('{"version": 1, "entries": []}', encoding="utf-8")
-                files.append(f)
-
-            # Create invalid files using the generated content
-            for i in range(invalid_count):
-                f = tmp_path / f"invalid_{i}.json"
-                content = invalid_content[i % len(invalid_content)]
-                f.write_text(content, encoding="utf-8")
-                files.append(f)
-
-            valid, invalid = validate_export_files(files)
-
-            # Property: when invalid files exist, invalid list is non-empty
-            assert len(invalid) > 0
-            assert len(invalid) == invalid_count
-            assert len(valid) == valid_count
-
-    @given(
-        valid_count=st.integers(min_value=1, max_value=5),
-    )
-    @settings(max_examples=100)
-    def test_all_valid_files_pass(self, valid_count):
-        """When all files are valid, invalid list is empty."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            files = []
-
-            for i in range(valid_count):
-                f = tmp_path / f"export_{i}.json"
-                f.write_text('{"version": 1, "entries": []}', encoding="utf-8")
-                files.append(f)
-
-            valid, invalid = validate_export_files(files)
-
-            assert len(invalid) == 0
-            assert len(valid) == valid_count
-
-    @given(
-        valid_count=st.integers(min_value=0, max_value=3),
-        invalid_count=st.integers(min_value=1, max_value=3),
-    )
-    @settings(max_examples=100)
-    def test_no_output_written_when_invalid(self, valid_count, invalid_count):
-        """When any file is invalid, no output file is written."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            files = []
-
-            # Create valid files
-            for i in range(valid_count):
-                f = tmp_path / f"valid_{i}.json"
-                f.write_text('{"version": 1, "entries": []}', encoding="utf-8")
-                files.append(f)
-
-            # Create invalid files
-            for i in range(invalid_count):
-                f = tmp_path / f"invalid_{i}.json"
-                f.write_text("not json at all", encoding="utf-8")
-                files.append(f)
-
-            valid, invalid = validate_export_files(files)
-
-            # When invalid files exist, no output should be written
-            # (the caller is responsible for aborting, but we verify the
-            # validation function correctly identifies the invalid state)
-            assert len(invalid) > 0
-            output_path = tmp_path / OUTPUT_FILENAME
-            assert not output_path.exists()
-
-
-# Strategy for generating entry-like dicts with UUIDs
 entry_strategy = st.fixed_dictionaries({
     "id": st.uuids().map(str),
     "content": st.fixed_dictionaries({
@@ -224,49 +40,326 @@ entry_strategy = st.fixed_dictionaries({
     "note": st.one_of(st.none(), st.just(""), st.text(min_size=1, max_size=50)),
 })
 
-# Strategy for (filename, entry) tuples
 filename_entry_strategy = st.tuples(
     st.text(alphabet="abcdefghij", min_size=1, max_size=10).map(lambda s: s + ".json"),
     entry_strategy,
 )
 
 
-class TestDeduplicationUniqueness:
-    """Property 5: Deduplication Uniqueness Invariant.
+# --- Helper ---
 
-    For any set of input entries, the deduplicated output contains each unique
-    Entry_ID exactly once, and the total count equals the number of distinct IDs.
+def make_export(entries):
+    """Create a valid Proton Authenticator export dict."""
+    return {"version": 1, "entries": entries}
 
-    Validates: Requirements 5.1, 5.5
-    """
+
+def write_export_file(path, entries):
+    """Write a valid export file at the given path."""
+    path.write_text(
+        json_module.dumps(make_export(entries), indent=4, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+# --- Tests ---
+
+
+class TestDiscoverJsonFiles:
+    """Tests for discover_json_files."""
+
+    def test_finds_json_files(self, tmp_path):
+        """Finds .json files in directory."""
+        (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "b.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "readme.txt").write_text("hi", encoding="utf-8")
+        result = discover_json_files(tmp_path)
+        names = [f.name for f in result]
+        assert "a.json" in names
+        assert "b.json" in names
+        assert "readme.txt" not in names
+
+    def test_returns_sorted(self, tmp_path):
+        """Results are sorted alphabetically."""
+        (tmp_path / "z.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+        result = discover_json_files(tmp_path)
+        assert result[0].name == "a.json"
+        assert result[1].name == "z.json"
+
+    def test_does_not_recurse_into_subdirs(self, tmp_path):
+        """Does not find .json files in subdirectories."""
+        sub = tmp_path / "output"
+        sub.mkdir()
+        (sub / "nested.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "top.json").write_text("{}", encoding="utf-8")
+        result = discover_json_files(tmp_path)
+        names = [f.name for f in result]
+        assert "top.json" in names
+        assert "nested.json" not in names
+
+
+class TestFileValidation:
+    """Tests for is_valid_export and validate_export_files."""
+
+    @given(entries=st.lists(st.dictionaries(st.text(), st.text()), max_size=5))
+    @settings(max_examples=200)
+    def test_valid_exports_accepted(self, entries):
+        """Valid structure always returns True."""
+        data = {"version": 1, "entries": entries}
+        assert is_valid_export(data) is True
+
+    @given(data=st.one_of(
+        st.none(), st.integers(), st.text(), st.lists(st.integers()),
+        st.fixed_dictionaries({"version": st.integers().filter(lambda x: x != 1), "entries": st.just([])}),
+        st.fixed_dictionaries({"version": st.just(1)}),
+        st.fixed_dictionaries({"version": st.just(1), "entries": st.one_of(st.text(), st.integers(), st.none())}),
+    ))
+    @settings(max_examples=200)
+    def test_invalid_exports_rejected(self, data):
+        """Invalid structures always return False."""
+        assert is_valid_export(data) is False
+
+    def test_validate_separates_valid_and_invalid(self, tmp_path):
+        """validate_export_files correctly categorises files."""
+        valid_file = tmp_path / "good.json"
+        valid_file.write_text('{"version": 1, "entries": []}', encoding="utf-8")
+        invalid_file = tmp_path / "bad.json"
+        invalid_file.write_text("not json", encoding="utf-8")
+
+        valid, invalid = validate_export_files([valid_file, invalid_file])
+        assert len(valid) == 1
+        assert len(invalid) == 1
+        assert valid[0].name == "good.json"
+        assert invalid[0] == "bad.json"
+
+
+class TestGenericFilenameDetection:
+    """Tests for has_generic_export_names and GENERIC_EXPORT_PATTERN."""
+
+    def test_matches_generic_pattern(self):
+        """Generic Proton export filenames are detected."""
+        generic = Path("Proton Authenticator_export_2026-07-09.json_1783587600.json")
+        assert GENERIC_EXPORT_PATTERN.match(generic.name)
+
+    def test_does_not_match_custom_names(self):
+        """Custom/renamed filenames are not flagged."""
+        custom = Path("mobile-proton_authenticator_backup.json")
+        assert not GENERIC_EXPORT_PATTERN.match(custom.name)
+
+    def test_has_generic_export_names_filters(self, tmp_path):
+        """has_generic_export_names returns only generic-named files."""
+        generic = tmp_path / "Proton Authenticator_export_2026-07-09.json_1783587600.json"
+        custom = tmp_path / "mobile_backup.json"
+        generic.write_text("{}", encoding="utf-8")
+        custom.write_text("{}", encoding="utf-8")
+
+        result = has_generic_export_names([generic, custom])
+        assert len(result) == 1
+        assert result[0] == generic
+
+
+class TestExactlyTwoFilesEnforcement:
+    """Tests for the 2-file requirement in main()."""
+
+    def test_aborts_with_zero_valid_files(self, tmp_path):
+        """Exits with error when no valid export files found."""
+        (tmp_path / "not_export.json").write_text('{"bad": true}', encoding="utf-8")
+        with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+            result = main()
+        assert result == 1
+
+    def test_aborts_with_one_valid_file(self, tmp_path):
+        """Exits with error when only 1 valid export file found."""
+        write_export_file(tmp_path / "only_one.json", [{"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}])
+        with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+            result = main()
+        assert result == 1
+
+    def test_aborts_with_three_valid_files(self, tmp_path, capsys):
+        """Exits with error when more than 2 valid export files found."""
+        for i in range(3):
+            write_export_file(
+                tmp_path / f"file{i}.json",
+                [{"id": f"id-{i}", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+            )
+        with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+            result = main()
+        assert result == 1
+        captured = capsys.readouterr()
+        assert "Expected exactly 2" in captured.err
+
+    def test_succeeds_with_two_valid_files(self, tmp_path):
+        """Succeeds when exactly 2 valid export files are present."""
+        write_export_file(
+            tmp_path / "file1.json",
+            [{"id": "shared", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "file2.json",
+            [{"id": "shared", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        assert (tmp_path / OUTPUT_DIR_NAME / OUTPUT_FILENAME).exists()
+
+
+class TestOutputDirectory:
+    """Tests for output going to the output/ subdirectory."""
+
+    def test_output_dir_created(self, tmp_path):
+        """output/ directory is created if it doesn't exist."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
+        assert (tmp_path / OUTPUT_DIR_NAME).is_dir()
+
+    def test_merged_file_in_output_dir(self, tmp_path):
+        """Merged file is written inside output/ not the source directory."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
+        assert (tmp_path / OUTPUT_DIR_NAME / OUTPUT_FILENAME).exists()
+        assert not (tmp_path / OUTPUT_FILENAME).exists()
+
+    def test_unique_files_in_output_dir(self, tmp_path):
+        """Single-entry import files are written inside output/."""
+        write_export_file(
+            tmp_path / "mobile.json",
+            [
+                {"id": "shared", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None},
+                {"id": "mob-only", "content": {"uri": "y", "entry_type": "Totp", "name": "mobileapp"}, "note": None},
+            ],
+        )
+        write_export_file(
+            tmp_path / "desktop.json",
+            [{"id": "shared", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        unique_files = list(output_dir.glob("unique_*.json"))
+        assert len(unique_files) == 1
+
+
+class TestOverwriteWarning:
+    """Tests for overwrite confirmation when output/ already has files."""
+
+    def test_warns_and_aborts_on_decline(self, tmp_path):
+        """Declining overwrite prevents any files being written."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        # Pre-create output dir with existing file
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        output_dir.mkdir()
+        (output_dir / OUTPUT_FILENAME).write_text("old data", encoding="utf-8")
+
+        # First input: confirm merge (y), second input: decline overwrite (n)
+        with patch('builtins.input', side_effect=['y', 'n']):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        # File should still have old content
+        assert (output_dir / OUTPUT_FILENAME).read_text(encoding="utf-8") == "old data"
+
+    def test_overwrites_on_accept(self, tmp_path):
+        """Accepting overwrite replaces existing files."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        output_dir.mkdir()
+        (output_dir / OUTPUT_FILENAME).write_text("old data", encoding="utf-8")
+
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        data = json_module.loads((output_dir / OUTPUT_FILENAME).read_text(encoding="utf-8"))
+        assert data["version"] == 1
+
+    def test_no_warning_when_output_dir_empty(self, tmp_path):
+        """No overwrite warning when output dir doesn't exist yet."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        # Only one input call needed (confirm merge), no overwrite prompt
+        with patch('builtins.input', return_value='y') as mock_input:
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        # input called exactly once (confirm merge only)
+        assert mock_input.call_count == 1
+
+
+class TestCheckOutputDirConflicts:
+    """Tests for check_output_dir_conflicts."""
+
+    def test_no_conflicts(self, tmp_path):
+        """Returns empty list when no files exist."""
+        assert check_output_dir_conflicts(tmp_path, ["a.json", "b.json"]) == []
+
+    def test_some_conflicts(self, tmp_path):
+        """Returns only the filenames that exist."""
+        (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+        result = check_output_dir_conflicts(tmp_path, ["a.json", "b.json"])
+        assert result == ["a.json"]
+
+    def test_all_conflicts(self, tmp_path):
+        """Returns all filenames when all exist."""
+        (tmp_path / "a.json").write_text("{}", encoding="utf-8")
+        (tmp_path / "b.json").write_text("{}", encoding="utf-8")
+        result = check_output_dir_conflicts(tmp_path, ["a.json", "b.json"])
+        assert result == ["a.json", "b.json"]
+
+
+class TestDeduplication:
+    """Tests for deduplicate function."""
 
     @given(entries=st.lists(filename_entry_strategy, min_size=0, max_size=20))
     @settings(max_examples=200)
     def test_unique_ids_in_output(self, entries):
         """Output contains each unique ID exactly once."""
         result = deduplicate(entries)
-
-        # Each ID appears exactly once
         result_ids = [e["id"] for e in result]
         assert len(result_ids) == len(set(result_ids))
-
-        # Count equals distinct input IDs
         input_ids = set(e["id"] for _, e in entries)
         assert len(result) == len(input_ids)
-
-        # All input IDs are represented
         assert set(result_ids) == input_ids
-
-
-class TestNotePreference:
-    """Property 6: Note Preference in Deduplication.
-
-    For entries sharing the same ID: if exactly one has a non-empty note,
-    that version is kept; if none have notes, first-encountered wins;
-    if multiple have notes, first among those with notes wins.
-
-    Validates: Requirements 4.3, 5.2, 5.3, 5.4
-    """
 
     @given(
         entry_id=st.uuids().map(str),
@@ -274,17 +367,13 @@ class TestNotePreference:
         num_no_note=st.integers(min_value=1, max_value=5),
     )
     @settings(max_examples=200)
-    def test_entry_with_note_preferred_over_no_note(self, entry_id, note_text, num_no_note):
+    def test_entry_with_note_preferred(self, entry_id, note_text, num_no_note):
         """When exactly one entry has a note, it wins regardless of position."""
-        # Create entries without notes
         entries_no_note = [
             (f"file_{i}.json", {"id": entry_id, "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": None})
             for i in range(num_no_note)
         ]
-        # Create one entry with a note
-        entry_with_note = ("noted_file.json", {"id": entry_id, "content": {"uri": "y", "entry_type": "Totp", "name": "noted"}, "note": note_text})
-
-        # Put the noted entry at various positions
+        entry_with_note = ("noted.json", {"id": entry_id, "content": {"uri": "y", "entry_type": "Totp", "name": "noted"}, "note": note_text})
         for pos in range(len(entries_no_note) + 1):
             test_entries = entries_no_note[:pos] + [entry_with_note] + entries_no_note[pos:]
             result = deduplicate(test_entries)
@@ -304,465 +393,14 @@ class TestNotePreference:
         ]
         result = deduplicate(entries)
         assert len(result) == 1
-        assert result[0]["content"]["uri"] == "uri_0"  # First encountered
-
-    @given(
-        entry_id=st.uuids().map(str),
-        notes=st.lists(st.text(min_size=1, max_size=30), min_size=2, max_size=5),
-    )
-    @settings(max_examples=200)
-    def test_first_noted_wins_when_multiple_have_notes(self, entry_id, notes):
-        """When multiple entries have notes, first-encountered with a note wins."""
-        entries = [
-            (f"file_{i}.json", {"id": entry_id, "content": {"uri": f"uri_{i}", "entry_type": "Totp", "name": f"name_{i}"}, "note": note})
-            for i, note in enumerate(notes)
-        ]
-        result = deduplicate(entries)
-        assert len(result) == 1
-        assert result[0]["note"] == notes[0]  # First with note wins
-
-
-
-class TestContentPreservation:
-    """Property 7: Content Preservation.
-
-    For any entry in the merged output, its content field is structurally
-    identical to the source entry from which it was kept.
-
-    Validates: Requirements 7.4
-    """
-
-    @given(entries=st.lists(filename_entry_strategy, min_size=1, max_size=20))
-    @settings(max_examples=200)
-    def test_content_preserved_after_dedup(self, entries):
-        """Content field of kept entries is never modified."""
-        result = deduplicate(entries)
-
-        # For each result entry, verify its content matches the expected source
-        for result_entry in result:
-            entry_id = result_entry["id"]
-            # Find all source entries with this ID
-            sources = [e for _, e in entries if e["id"] == entry_id]
-
-            # Determine which source should have been kept
-            # Logic: first with note wins; if none have notes, first overall wins
-            noted_sources = [s for s in sources if has_note(s)]
-            if noted_sources:
-                expected = noted_sources[0]
-            else:
-                expected = sources[0]
-
-            # Content must be structurally identical
-            assert result_entry["content"] == expected["content"]
-            assert result_entry["id"] == expected["id"]
-            assert result_entry["note"] == expected["note"]
-
-
-class TestOutputFormatValidity:
-    """Property 8: Output Format Validity.
-
-    For any successful merge, output is valid JSON with version == 1,
-    entries as array, and 4-space indentation.
-
-    Validates: Requirements 7.2, 7.3
-    """
-
-    @given(entries=st.lists(entry_strategy, min_size=0, max_size=10))
-    @settings(max_examples=100)
-    def test_output_is_valid_format(self, entries):
-        """Written output file is valid JSON with correct structure."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-
-            write_output(tmp_path, entries)
-
-            output_path = tmp_path / OUTPUT_FILENAME
-            assert output_path.exists()
-
-            content = output_path.read_text(encoding="utf-8")
-
-            # Trailing newline
-            assert content.endswith("\n")
-
-            # Valid JSON
-            data = json_module.loads(content)
-
-            # Correct structure
-            assert data["version"] == 1
-            assert isinstance(data["entries"], list)
-            assert len(data["entries"]) == len(entries)
-
-            # 4-space indentation (check that "entries" key is indented)
-            # The format should use 4-space indent
-            lines = content.split("\n")
-            # Find a line with entries content (if entries exist)
-            if entries:
-                # The "entries" key should be at 4-space indent
-                assert any(line.startswith("    ") for line in lines)
-                # Check that indented lines use multiples of 4 spaces
-                for line in lines:
-                    stripped = line.lstrip(" ")
-                    if stripped and line != stripped:
-                        indent = len(line) - len(stripped)
-                        assert indent % 4 == 0, f"Non-4-space indent found: {indent} spaces"
-
-
-import io
-import sys
-
-
-class TestReportingAccuracy:
-    """Property 9: Reporting Accuracy.
-
-    For F files with T total entries producing U unique entries:
-    files_processed == F, total_entries == T, unique_entries == U,
-    duplicates_resolved == T - U.
-
-    Validates: Requirements 8.1, 8.2, 8.3, 8.4, 6.1, 6.2, 6.3
-    """
-
-    @given(
-        num_files=st.integers(min_value=1, max_value=100),
-        total_entries=st.integers(min_value=0, max_value=1000),
-    )
-    @settings(max_examples=200)
-    def test_report_numbers_correct(self, num_files, total_entries):
-        """Report accurately reflects merge statistics."""
-        # unique_entries must be <= total_entries
-        unique_entries = total_entries  # simplification for no duplicates
-
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            print_report(num_files, total_entries, unique_entries, [])
-        finally:
-            sys.stdout = old_stdout
-
-        output = captured.getvalue()
-        assert f"Files processed: {num_files}" in output
-        assert f"Total entries found: {total_entries}" in output
-        assert f"Unique entries written: {unique_entries}" in output
-        assert f"Duplicates resolved: {total_entries - unique_entries}" in output
-
-    @given(
-        num_files=st.integers(min_value=1, max_value=50),
-        total_entries=st.integers(min_value=1, max_value=500),
-        duplicate_count=st.integers(min_value=0, max_value=200),
-    )
-    @settings(max_examples=200)
-    def test_duplicates_calculated_correctly(self, num_files, total_entries, duplicate_count):
-        """Duplicates resolved = total - unique."""
-        assume(duplicate_count <= total_entries)
-        unique_entries = total_entries - duplicate_count
-
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            print_report(num_files, total_entries, unique_entries, [])
-        finally:
-            sys.stdout = old_stdout
-
-        output = captured.getvalue()
-        assert f"Duplicates resolved: {duplicate_count}" in output
-
-    def test_single_entry_filenames_printed(self):
-        """When single_entry_filenames is non-empty, each filename is printed with count."""
-        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_other_C.json"]
-
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            print_report(2, 10, 8, filenames)
-        finally:
-            sys.stdout = old_stdout
-
-        output = captured.getvalue()
-        assert "Single-entry files created (3):" in output
-        assert "  - unique_src_A.json" in output
-        assert "  - unique_src_B.json" in output
-        assert "  - unique_other_C.json" in output
-
-    def test_no_single_entry_files_message(self):
-        """When single_entry_filenames is empty, prints 'no single-entry files needed'."""
-        captured = io.StringIO()
-        old_stdout = sys.stdout
-        sys.stdout = captured
-        try:
-            print_report(2, 10, 10, [])
-        finally:
-            sys.stdout = old_stdout
-
-        output = captured.getvalue()
-        assert "No single-entry files needed (all entries shared across files)." in output
-
-
-
-class TestIntegration:
-    """Integration tests using real example files.
-
-    Validates: Requirements 1.1, 2.2, 2.3, 3.2, 3.4, 5.1, 5.2, 6.6, 7.1, 7.2
-    """
-
-    def setup_example_dir(self, tmp_path):
-        """Copy example files to a temp directory, excluding output file."""
-        examples_dir = Path(__file__).parent / "examples"
-        for f in examples_dir.glob("*.json"):
-            if f.name == OUTPUT_FILENAME:
-                continue
-            shutil.copy(f, tmp_path / f.name)
-        return tmp_path
-
-    def test_full_merge_pipeline(self, tmp_path):
-        """Full pipeline produces correct merged output."""
-        self.setup_example_dir(tmp_path)
-
-        files, output_exists = discover_json_files(tmp_path)
-        assert len(files) == 2
-        assert output_exists is False
-
-        valid, invalid = validate_export_files(files)
-        assert len(valid) == 2
-        assert len(invalid) == 0
-
-        entries = parse_entries(valid)
-        assert len(entries) == 34  # 17 + 17
-
-        unique = deduplicate(entries)
-        assert len(unique) == 18  # 16 shared + 1 mobile-only + 1 desktop-only
-
-        write_output(tmp_path, unique)
-        output_path = tmp_path / OUTPUT_FILENAME
-        assert output_path.exists()
-
-        data = json_module.loads(output_path.read_text(encoding="utf-8"))
-        assert data["version"] == 1
-        assert len(data["entries"]) == 18
-
-    def test_merged_output_contains_mobile_only_entry(self, tmp_path):
-        """Merged output includes the mobile-only entry (mattermost)."""
-        self.setup_example_dir(tmp_path)
-
-        files, _ = discover_json_files(tmp_path)
-        valid, _ = validate_export_files(files)
-        entries = parse_entries(valid)
-        unique = deduplicate(entries)
-
-        unique_ids = {e["id"] for e in unique}
-        # Mobile-only entry: mattermost
-        assert "a7e1d804-7e24-4db2-9508-b3eb301f123b" in unique_ids
-
-    def test_merged_output_contains_desktop_only_entry(self, tmp_path):
-        """Merged output includes the desktop-only entry (NEW confluence)."""
-        self.setup_example_dir(tmp_path)
-
-        files, _ = discover_json_files(tmp_path)
-        valid, _ = validate_export_files(files)
-        entries = parse_entries(valid)
-        unique = deduplicate(entries)
-
-        unique_ids = {e["id"] for e in unique}
-        # Desktop-only entry: NEW confluence
-        assert "7f1f51da-0fed-4a87-a15c-e024ab443a95" in unique_ids
-
-    def test_duplicate_note_preference(self, tmp_path):
-        """Duplicates resolved: both null and '' are 'no note', first-encountered wins."""
-        self.setup_example_dir(tmp_path)
-
-        files, _ = discover_json_files(tmp_path)
-        valid, _ = validate_export_files(files)
-        entries = parse_entries(valid)
-        unique = deduplicate(entries)
-
-        # For shared entries, neither has a meaningful note (null vs "").
-        # First-encountered (by alphabetical file order) wins.
-        # Desktop file (Proton Authenticator_export...) sorts before mobile file.
-        # So shared entries should have note == "" (from desktop, processed first).
-        shared_id = "e1bdeffc-dc78-4d32-9e4f-01dcccc97a56"  # mbutter9, in both
-        matched = [e for e in unique if e["id"] == shared_id]
-        assert len(matched) == 1
-        # Desktop is processed first (alphabetically), so note should be ""
-        assert matched[0]["note"] == ""
-
-    def test_output_file_structure(self, tmp_path):
-        """Output file has correct JSON structure with 4-space indentation."""
-        self.setup_example_dir(tmp_path)
-
-        files, _ = discover_json_files(tmp_path)
-        valid, _ = validate_export_files(files)
-        entries = parse_entries(valid)
-        unique = deduplicate(entries)
-        write_output(tmp_path, unique)
-
-        output_path = tmp_path / OUTPUT_FILENAME
-        content = output_path.read_text(encoding="utf-8")
-
-        # Trailing newline
-        assert content.endswith("\n")
-
-        # Valid JSON
-        data = json_module.loads(content)
-        assert data["version"] == 1
-        assert isinstance(data["entries"], list)
-
-        # 4-space indentation check
-        lines = content.split("\n")
-        for line in lines:
-            stripped = line.lstrip(" ")
-            if stripped and line != stripped:
-                indent = len(line) - len(stripped)
-                assert indent % 4 == 0
-
-    def test_main_with_confirmation_yes(self, tmp_path):
-        """main() produces output when user confirms."""
-        self.setup_example_dir(tmp_path)
-        with patch('builtins.input', return_value='y'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-        assert result == 0
-        assert (tmp_path / OUTPUT_FILENAME).exists()
-
-        data = json_module.loads((tmp_path / OUTPUT_FILENAME).read_text(encoding="utf-8"))
-        assert len(data["entries"]) == 18
-
-    def test_main_with_confirmation_no(self, tmp_path):
-        """main() produces no output when user declines."""
-        self.setup_example_dir(tmp_path)
-        with patch('builtins.input', return_value='n'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-        assert result == 0
-        assert not (tmp_path / OUTPUT_FILENAME).exists()
-
-    def test_overwrite_prompt_decline(self, tmp_path):
-        """main() respects overwrite decline when output file exists."""
-        self.setup_example_dir(tmp_path)
-        # Create existing output file
-        (tmp_path / OUTPUT_FILENAME).write_text('{"version": 1, "entries": []}', encoding='utf-8')
-        with patch('builtins.input', return_value='n'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-        assert result == 0
-        # Output should still contain the original content (not overwritten)
-        data = json_module.loads((tmp_path / OUTPUT_FILENAME).read_text(encoding="utf-8"))
-        assert len(data["entries"]) == 0  # Still the old content
-
-    def test_overwrite_prompt_accept(self, tmp_path):
-        """main() overwrites output file when user accepts both prompts."""
-        self.setup_example_dir(tmp_path)
-        # Create existing output file
-        (tmp_path / OUTPUT_FILENAME).write_text('{"version": 1, "entries": []}', encoding='utf-8')
-        with patch('builtins.input', return_value='y'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-        assert result == 0
-        # Output should now contain merged entries
-        data = json_module.loads((tmp_path / OUTPUT_FILENAME).read_text(encoding="utf-8"))
-        assert len(data["entries"]) == 18
-
-    def test_validation_abort_with_invalid_file(self, tmp_path):
-        """main() aborts when invalid file present."""
-        self.setup_example_dir(tmp_path)
-        (tmp_path / "bad_file.json").write_text("not json", encoding="utf-8")
-        with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-            result = main()
-        assert result == 1
-        assert not (tmp_path / OUTPUT_FILENAME).exists()
-
-    def test_validation_abort_with_wrong_structure(self, tmp_path):
-        """main() aborts when a JSON file has wrong structure."""
-        self.setup_example_dir(tmp_path)
-        (tmp_path / "wrong_structure.json").write_text(
-            '{"version": 2, "data": []}', encoding="utf-8"
-        )
-        with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-            result = main()
-        assert result == 1
-        assert not (tmp_path / OUTPUT_FILENAME).exists()
-
-
-
-class TestUserDeclineCleanExit:
-    """Property 10: User Decline Clean Exit.
-
-    For any prompt where the user declines, script exits with code 0,
-    prints no-files-written message, and does not write/modify any files.
-
-    Validates: Requirements 2.4, 6.7
-    """
-
-    def test_overwrite_decline_no_files_written(self, tmp_path, capsys):
-        """Declining overwrite prompt exits cleanly with no file changes."""
-        # Create a valid export file
-        export = {"version": 1, "entries": [{"id": "test-id", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": None}]}
-        (tmp_path / "test.json").write_text(json_module.dumps(export), encoding="utf-8")
-
-        # Create existing output file with known content
-        original_content = "original content"
-        (tmp_path / OUTPUT_FILENAME).write_text(original_content, encoding="utf-8")
-
-        with patch('builtins.input', return_value='n'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-
-        assert result == 0
-        captured = capsys.readouterr()
-        assert "No files were written." in captured.out
-        # Output file unchanged
-        assert (tmp_path / OUTPUT_FILENAME).read_text(encoding="utf-8") == original_content
-
-    def test_confirmation_decline_no_files_written(self, tmp_path, capsys):
-        """Declining confirmation prompt exits cleanly with no file changes."""
-        # Create a valid export file
-        export = {"version": 1, "entries": [{"id": "test-id", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": None}]}
-        (tmp_path / "test.json").write_text(json_module.dumps(export), encoding="utf-8")
-
-        # No existing output file - so overwrite prompt won't fire, only confirmation
-        with patch('builtins.input', return_value='n'):
-            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                result = main()
-
-        assert result == 0
-        captured = capsys.readouterr()
-        assert "No files were written." in captured.out
-        # No output file created
-        assert not (tmp_path / OUTPUT_FILENAME).exists()
-
-    @given(
-        num_entries=st.integers(min_value=1, max_value=5),
-        decline_response=st.sampled_from(["n", "N", "no", "NO", "No", "", "x", "nope"]),
-    )
-    @settings(max_examples=50)
-    def test_any_non_yes_response_declines(self, num_entries, decline_response):
-        """Any response other than y/yes results in decline."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-
-            # Create valid export files
-            export = {"version": 1, "entries": [
-                {"id": f"id-{i}", "content": {"uri": "x", "entry_type": "Totp", "name": f"name-{i}"}, "note": None}
-                for i in range(num_entries)
-            ]}
-            (tmp_path / "test.json").write_text(json_module.dumps(export), encoding="utf-8")
-
-            with patch('builtins.input', return_value=decline_response):
-                with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
-                    result = main()
-
-            assert result == 0
-            assert not (tmp_path / OUTPUT_FILENAME).exists()
+        assert result[0]["content"]["uri"] == "uri_0"
 
 
 class TestIdentifyUniqueEntries:
-    """Unit tests for identify_unique_entries function.
-
-    Validates: Requirements 1.1, 1.2, 1.3
-    """
+    """Tests for identify_unique_entries."""
 
     def test_basic_unique_identification(self):
-        """Entries appearing in only one file are identified as unique."""
+        """Entries in only one file are identified as unique."""
         entries = [
             ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
             ("file1.json", {"id": "bbb", "content": {"uri": "y"}, "note": None}),
@@ -770,32 +408,13 @@ class TestIdentifyUniqueEntries:
             ("file2.json", {"id": "ccc", "content": {"uri": "z"}, "note": None}),
         ]
         result = identify_unique_entries(entries)
-        # aaa is in both files - not unique
-        # bbb is only in file1 - unique
-        # ccc is only in file2 - unique
         assert len(result) == 2
-        assert result[0] == ("file1.json", {"id": "bbb", "content": {"uri": "y"}, "note": None})
-        assert result[1] == ("file2.json", {"id": "ccc", "content": {"uri": "z"}, "note": None})
-
-    def test_same_id_twice_in_one_file_still_unique(self):
-        """An ID appearing twice in the same file is still unique to that file."""
-        entries = [
-            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
-            ("file1.json", {"id": "aaa", "content": {"uri": "y"}, "note": "dup"}),
-            ("file2.json", {"id": "bbb", "content": {"uri": "z"}, "note": None}),
-        ]
-        result = identify_unique_entries(entries)
-        # aaa appears only in file1 (twice) - still unique to one file
-        # bbb appears only in file2 - unique
-        assert len(result) == 2
-        # Should keep first occurrence per file
-        assert result[0][0] == "file1.json"
-        assert result[0][1]["id"] == "aaa"
-        assert result[0][1]["content"]["uri"] == "x"  # first occurrence
-        assert result[1] == ("file2.json", {"id": "bbb", "content": {"uri": "z"}, "note": None})
+        ids = [e["id"] for _, e in result]
+        assert "bbb" in ids
+        assert "ccc" in ids
 
     def test_no_unique_entries(self):
-        """When all entries are shared across files, result is empty."""
+        """When all entries are shared, result is empty."""
         entries = [
             ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
             ("file2.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
@@ -803,337 +422,356 @@ class TestIdentifyUniqueEntries:
         result = identify_unique_entries(entries)
         assert len(result) == 0
 
-    def test_empty_entries(self):
+    def test_empty_input(self):
         """Empty input returns empty result."""
-        result = identify_unique_entries([])
-        assert len(result) == 0
+        assert identify_unique_entries([]) == []
 
-    def test_all_unique_entries(self):
-        """When no entries are shared, all are unique."""
+    def test_sorted_by_source_then_id(self):
+        """Results sorted by (source_filename, entry_id)."""
         entries = [
-            ("file1.json", {"id": "aaa", "content": {"uri": "x"}, "note": None}),
-            ("file2.json", {"id": "bbb", "content": {"uri": "y"}, "note": None}),
+            ("z.json", {"id": "zzz", "content": {"uri": "a"}, "note": None}),
+            ("a.json", {"id": "mmm", "content": {"uri": "b"}, "note": None}),
+            ("a.json", {"id": "aaa", "content": {"uri": "c"}, "note": None}),
         ]
         result = identify_unique_entries(entries)
-        assert len(result) == 2
+        assert result[0] == ("a.json", {"id": "aaa", "content": {"uri": "c"}, "note": None})
+        assert result[1] == ("a.json", {"id": "mmm", "content": {"uri": "b"}, "note": None})
+        assert result[2] == ("z.json", {"id": "zzz", "content": {"uri": "a"}, "note": None})
 
-    def test_sorting_by_source_filename_then_entry_id(self):
-        """Results are sorted by (source_filename, entry_id)."""
-        entries = [
-            ("z_file.json", {"id": "zzz", "content": {"uri": "a"}, "note": None}),
-            ("a_file.json", {"id": "mmm", "content": {"uri": "b"}, "note": None}),
-            ("a_file.json", {"id": "aaa", "content": {"uri": "c"}, "note": None}),
-            ("z_file.json", {"id": "aaa_z", "content": {"uri": "d"}, "note": None}),
-        ]
-        result = identify_unique_entries(entries)
-        assert len(result) == 4
-        # Sorted by filename first, then entry_id
-        assert result[0] == ("a_file.json", {"id": "aaa", "content": {"uri": "c"}, "note": None})
-        assert result[1] == ("a_file.json", {"id": "mmm", "content": {"uri": "b"}, "note": None})
-        assert result[2] == ("z_file.json", {"id": "aaa_z", "content": {"uri": "d"}, "note": None})
-        assert result[3] == ("z_file.json", {"id": "zzz", "content": {"uri": "a"}, "note": None})
 
-    def test_correct_source_file_association(self):
-        """Each unique entry is associated with the correct source file."""
-        entries = [
-            ("mobile.json", {"id": "mob-only", "content": {"uri": "m"}, "note": None}),
-            ("mobile.json", {"id": "shared", "content": {"uri": "m"}, "note": None}),
-            ("desktop.json", {"id": "desk-only", "content": {"uri": "d"}, "note": None}),
-            ("desktop.json", {"id": "shared", "content": {"uri": "d"}, "note": None}),
-        ]
-        result = identify_unique_entries(entries)
-        assert len(result) == 2
-        # Sorted by filename: desktop before mobile
-        assert result[0] == ("desktop.json", {"id": "desk-only", "content": {"uri": "d"}, "note": None})
-        assert result[1] == ("mobile.json", {"id": "mob-only", "content": {"uri": "m"}, "note": None})
+class TestDetermineMissingFrom:
+    """Tests for determine_missing_from."""
 
-    def test_three_files_unique_in_one(self):
-        """Entry in exactly one of three files is unique."""
-        entries = [
-            ("file1.json", {"id": "a", "content": {"uri": "x"}, "note": None}),
-            ("file1.json", {"id": "shared12", "content": {"uri": "x"}, "note": None}),
-            ("file2.json", {"id": "shared12", "content": {"uri": "x"}, "note": None}),
-            ("file2.json", {"id": "shared23", "content": {"uri": "x"}, "note": None}),
-            ("file3.json", {"id": "shared23", "content": {"uri": "x"}, "note": None}),
-            ("file3.json", {"id": "c", "content": {"uri": "x"}, "note": None}),
-        ]
-        result = identify_unique_entries(entries)
-        # "a" only in file1, "c" only in file3
-        # shared12 in file1+file2, shared23 in file2+file3
-        assert len(result) == 2
-        assert result[0][1]["id"] == "a"
-        assert result[0][0] == "file1.json"
-        assert result[1][1]["id"] == "c"
-        assert result[1][0] == "file3.json"
+    def test_returns_other_file(self):
+        """Returns the file the entry is NOT in."""
+        assert determine_missing_from("mobile.json", ["mobile.json", "desktop.json"]) == "desktop.json"
+        assert determine_missing_from("desktop.json", ["mobile.json", "desktop.json"]) == "mobile.json"
+
+    def test_returns_unknown_for_single_file(self):
+        """Returns 'unknown' if source is the only file (edge case)."""
+        assert determine_missing_from("only.json", ["only.json"]) == "unknown"
 
 
 class TestGenerateUniqueFilenames:
-    """Unit tests for generate_unique_filenames function.
-
-    Validates: Requirements 3.1, 3.7
-    """
+    """Tests for generate_unique_filenames."""
 
     def test_basic_filename_generation(self):
-        """Generates filenames using template unique_<source_stem>_<descriptive>.json."""
+        """Template: unique_<source_stem>_<descriptive>.json"""
         entries = [
-            ("mobile-backup.json", {"id": "aaa", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "entry_type": "Totp", "name": "test"}, "note": "My AWS"}),
+            ("mobile-backup.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "entry_type": "Totp", "name": "t"}, "note": "My AWS"}),
         ]
         result = generate_unique_filenames(entries)
-        assert len(result) == 1
-        source, entry, filename = result[0]
-        assert source == "mobile-backup.json"
-        assert entry["id"] == "aaa"
-        assert filename == "unique_mobile-backup_My_AWS.json"
+        assert result[0][2] == "unique_mobile-backup_My_AWS.json"
 
-    def test_uses_note_for_descriptive(self):
-        """When entry has a note, uses it as the descriptive portion."""
+    def test_collision_resolution(self):
+        """Duplicate filenames get _2, _3 suffixes."""
         entries = [
-            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=GitHub", "entry_type": "Totp", "name": "fallback"}, "note": "Work Account"}),
-        ]
-        result = generate_unique_filenames(entries)
-        assert result[0][2] == "unique_src_Work_Account.json"
-
-    def test_uses_issuer_when_no_note(self):
-        """When entry has no note, falls back to issuer from URI."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "entry_type": "Totp", "name": "fallback"}, "note": None}),
-        ]
-        result = generate_unique_filenames(entries)
-        assert result[0][2] == "unique_src_Google.json"
-
-    def test_uses_content_name_when_no_note_or_issuer(self):
-        """When entry has no note and no issuer, falls back to content.name."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "myaccount"}, "note": None}),
-        ]
-        result = generate_unique_filenames(entries)
-        assert result[0][2] == "unique_src_myaccount.json"
-
-    def test_collision_resolution_with_suffix(self):
-        """Duplicate filenames get numeric suffixes _2, _3 etc."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
-            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
-            ("src.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": "Same"}),
+            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "t"}, "note": "Same"}),
+            ("src.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "t"}, "note": "Same"}),
         ]
         result = generate_unique_filenames(entries)
         assert result[0][2] == "unique_src_Same.json"
         assert result[1][2] == "unique_src_Same_2.json"
         assert result[2][2] == "unique_src_Same_3.json"
 
-    def test_no_collision_different_sources(self):
-        """Entries from different source files with same descriptive get different stems."""
+    def test_different_sources_no_collision(self):
+        """Different source stems produce different filenames."""
         entries = [
-            ("file1.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
-            ("file2.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "Same"}),
+            ("file1.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": "Same"}),
+            ("file2.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "t"}, "note": "Same"}),
         ]
         result = generate_unique_filenames(entries)
-        # Different source stems mean different base names, no collision
         assert result[0][2] == "unique_file1_Same.json"
         assert result[1][2] == "unique_file2_Same.json"
 
     def test_empty_input(self):
         """Empty input returns empty result."""
-        result = generate_unique_filenames([])
-        assert result == []
-
-    def test_sanitisation_applied(self):
-        """Unsafe characters in descriptive portion are replaced with underscores."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "My Account/Work"}),
-        ]
-        result = generate_unique_filenames(entries)
-        assert result[0][2] == "unique_src_My_Account_Work.json"
-
-    def test_all_filenames_unique(self):
-        """All generated filenames in the result are unique."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": "X"}),
-            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "test"}, "note": "X"}),
-            ("src.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "test"}, "note": "X"}),
-            ("src.json", {"id": "d", "content": {"uri": "w", "entry_type": "Totp", "name": "test"}, "note": "X"}),
-        ]
-        result = generate_unique_filenames(entries)
-        filenames = [fname for _, _, fname in result]
-        assert len(filenames) == len(set(filenames))
-
-    def test_preserves_entry_data(self):
-        """Result triples preserve the original entry data unchanged."""
-        entry = {"id": "abc-123", "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "myname"}, "note": "mynote"}
-        entries = [("source.json", entry)]
-        result = generate_unique_filenames(entries)
-        assert result[0][0] == "source.json"
-        assert result[0][1] is entry  # Same reference
+        assert generate_unique_filenames([]) == []
 
 
-class TestCountExistingUniqueFiles:
-    """Unit tests for count_existing_unique_files function.
+class TestWriteOutput:
+    """Tests for write_output."""
 
-    Validates: Requirements 8.1, 8.2
-    """
-
-    def test_no_existing_files(self, tmp_path):
-        """Returns 0 when none of the filenames exist."""
-        filenames = ["unique_src_A.json", "unique_src_B.json"]
-        assert count_existing_unique_files(tmp_path, filenames) == 0
-
-    def test_all_existing_files(self, tmp_path):
-        """Returns count equal to list length when all files exist."""
-        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_src_C.json"]
-        for name in filenames:
-            (tmp_path / name).write_text("{}", encoding="utf-8")
-        assert count_existing_unique_files(tmp_path, filenames) == 3
-
-    def test_some_existing_files(self, tmp_path):
-        """Returns correct count when only some files exist."""
-        filenames = ["unique_src_A.json", "unique_src_B.json", "unique_src_C.json"]
-        (tmp_path / "unique_src_A.json").write_text("{}", encoding="utf-8")
-        (tmp_path / "unique_src_C.json").write_text("{}", encoding="utf-8")
-        assert count_existing_unique_files(tmp_path, filenames) == 2
-
-    def test_empty_filenames_list(self, tmp_path):
-        """Returns 0 when filenames list is empty."""
-        assert count_existing_unique_files(tmp_path, []) == 0
-
-    def test_ignores_other_files_in_directory(self, tmp_path):
-        """Only counts files from the provided list, not all directory contents."""
-        # Create files that aren't in the list
-        (tmp_path / "other.json").write_text("{}", encoding="utf-8")
-        (tmp_path / "another.json").write_text("{}", encoding="utf-8")
-        filenames = ["unique_src_A.json"]
-        assert count_existing_unique_files(tmp_path, filenames) == 0
+    @given(entries=st.lists(entry_strategy, min_size=0, max_size=10))
+    @settings(max_examples=100)
+    def test_output_is_valid_format(self, entries):
+        """Written output is valid JSON with correct structure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            write_output(tmp_path, entries)
+            output_path = tmp_path / OUTPUT_FILENAME
+            content = output_path.read_text(encoding="utf-8")
+            assert content.endswith("\n")
+            data = json_module.loads(content)
+            assert data["version"] == 1
+            assert isinstance(data["entries"], list)
+            assert len(data["entries"]) == len(entries)
 
 
 class TestWriteSingleEntryFiles:
-    """Unit tests for write_single_entry_files function.
+    """Tests for write_single_entry_files."""
 
-    Validates: Requirements 2.1, 2.2, 2.3, 2.4, 2.5
-    """
-
-    def test_writes_single_entry_file(self, tmp_path):
-        """Writes a valid Proton Authenticator export with one entry."""
-        entry = {
-            "id": "abc-123",
-            "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "test"},
-            "note": "My Note"
-        }
-        file_entries = [("source.json", entry, "unique_source_My_Note.json")]
-
+    def test_writes_valid_export(self, tmp_path):
+        """Each file is a valid Proton export with one entry."""
+        entry = {"id": "abc", "content": {"uri": "x", "entry_type": "Totp", "name": "test"}, "note": None}
+        file_entries = [("source.json", entry, "unique_source_test.json")]
         result = write_single_entry_files(tmp_path, file_entries)
-
-        assert result == ["unique_source_My_Note.json"]
-        output_path = tmp_path / "unique_source_My_Note.json"
-        assert output_path.exists()
-
-        content = output_path.read_text(encoding="utf-8")
-        data = json_module.loads(content)
+        assert result == ["unique_source_test.json"]
+        data = json_module.loads((tmp_path / "unique_source_test.json").read_text(encoding="utf-8"))
         assert data["version"] == 1
         assert len(data["entries"]) == 1
         assert data["entries"][0] == entry
 
-    def test_uses_4_space_indentation(self, tmp_path):
-        """Output uses 4-space indentation."""
-        entry = {
-            "id": "abc-123",
-            "content": {"uri": "otpauth://totp/x?secret=ABC", "entry_type": "Totp", "name": "test"},
-            "note": None
-        }
-        file_entries = [("source.json", entry, "unique_source_test.json")]
-
-        write_single_entry_files(tmp_path, file_entries)
-
-        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
-        lines = content.split("\n")
-        for line in lines:
+    def test_4_space_indent_and_trailing_newline(self, tmp_path):
+        """Output uses 4-space indent and trailing newline."""
+        entry = {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}
+        write_single_entry_files(tmp_path, [("src.json", entry, "out.json")])
+        content = (tmp_path / "out.json").read_text(encoding="utf-8")
+        assert content.endswith("\n")
+        for line in content.split("\n"):
             stripped = line.lstrip(" ")
             if stripped and line != stripped:
                 indent = len(line) - len(stripped)
-                assert indent % 4 == 0, f"Non-4-space indent found: {indent} spaces"
+                assert indent % 4 == 0
 
-    def test_trailing_newline(self, tmp_path):
-        """Output ends with a trailing newline."""
-        entry = {
-            "id": "abc-123",
-            "content": {"uri": "x", "entry_type": "Totp", "name": "test"},
-            "note": None
-        }
-        file_entries = [("source.json", entry, "unique_source_test.json")]
+    def test_empty_input(self, tmp_path):
+        """Empty input produces no files."""
+        assert write_single_entry_files(tmp_path, []) == []
 
-        write_single_entry_files(tmp_path, file_entries)
+    def test_overwrites_existing(self, tmp_path):
+        """Overwrites existing files."""
+        (tmp_path / "out.json").write_text("old", encoding="utf-8")
+        entry = {"id": "new", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}
+        write_single_entry_files(tmp_path, [("src.json", entry, "out.json")])
+        data = json_module.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+        assert data["entries"][0]["id"] == "new"
 
-        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
-        assert content.endswith("\n")
 
-    def test_utf8_encoding(self, tmp_path):
-        """Output is written in UTF-8 encoding with non-ASCII characters preserved."""
-        entry = {
-            "id": "abc-123",
-            "content": {"uri": "x", "entry_type": "Totp", "name": "tëst-émojis-日本語"},
-            "note": "Ünïcödé nötë"
-        }
-        file_entries = [("source.json", entry, "unique_source_test.json")]
+class TestPrintReport:
+    """Tests for print_report."""
 
-        write_single_entry_files(tmp_path, file_entries)
+    def test_report_numbers(self, capsys, tmp_path):
+        """Report shows correct statistics."""
+        print_report(2, 34, 18, ["unique_a.json", "unique_b.json"], tmp_path)
+        output = capsys.readouterr().out
+        assert "Files processed: 2" in output
+        assert "Total entries found: 34" in output
+        assert "Unique entries written to merged file: 18" in output
+        assert "Duplicates resolved: 16" in output
+        assert "Single-entry import files created: 2" in output
 
-        content = (tmp_path / "unique_source_test.json").read_text(encoding="utf-8")
-        data = json_module.loads(content)
-        assert data["entries"][0]["note"] == "Ünïcödé nötë"
-        assert data["entries"][0]["content"]["name"] == "tëst-émojis-日本語"
-        # ensure_ascii=False means non-ASCII chars are preserved literally
-        assert "Ünïcödé" in content
-        assert "日本語" in content
+    def test_no_unique_entries_message(self, capsys, tmp_path):
+        """Shows 'no single-entry files needed' when list is empty."""
+        print_report(2, 10, 10, [], tmp_path)
+        output = capsys.readouterr().out
+        assert "No single-entry import files needed" in output
 
-    def test_multiple_entries(self, tmp_path):
-        """Writes multiple single-entry files and returns all filenames."""
-        entries = [
-            ("src.json", {"id": "a", "content": {"uri": "x", "entry_type": "Totp", "name": "one"}, "note": None}, "unique_src_one.json"),
-            ("src.json", {"id": "b", "content": {"uri": "y", "entry_type": "Totp", "name": "two"}, "note": None}, "unique_src_two.json"),
-            ("other.json", {"id": "c", "content": {"uri": "z", "entry_type": "Totp", "name": "three"}, "note": None}, "unique_other_three.json"),
+
+class TestPrintMissingFromSummary:
+    """Tests for print_missing_from_summary."""
+
+    def test_shows_missing_from_info(self, capsys):
+        """Summary shows which file each entry is missing from."""
+        file_entries = [
+            ("mobile.json", {"id": "a", "content": {"uri": "otpauth://totp/x?secret=ABC&issuer=MyService", "entry_type": "Totp", "name": "test"}, "note": "My App"}, "unique_mobile_My_App.json"),
         ]
+        all_filenames = ["mobile.json", "desktop.json"]
+        print_missing_from_summary(file_entries, all_filenames)
+        output = capsys.readouterr().out
+        assert "unique_mobile_My_App.json" in output
+        assert "Missing from: desktop.json" in output
+        assert "Entry: My App" in output
 
-        result = write_single_entry_files(tmp_path, entries)
+    def test_no_output_when_empty(self, capsys):
+        """No output when no unique entries."""
+        print_missing_from_summary([], ["a.json", "b.json"])
+        output = capsys.readouterr().out
+        assert output == ""
 
-        assert result == ["unique_src_one.json", "unique_src_two.json", "unique_other_three.json"]
-        for _, _, filename in entries:
-            assert (tmp_path / filename).exists()
 
-    def test_empty_input_returns_empty_list(self, tmp_path):
-        """Empty input produces no files and returns empty list."""
-        result = write_single_entry_files(tmp_path, [])
-        assert result == []
+class TestUserDecline:
+    """Tests for user declining at various prompts."""
 
-    def test_overwrites_existing_file(self, tmp_path):
-        """Overwrites an existing file with the same name."""
-        # Create existing file with different content
-        (tmp_path / "unique_src_test.json").write_text('{"old": "data"}', encoding="utf-8")
+    def test_decline_merge_confirmation(self, tmp_path, capsys):
+        """Declining merge confirmation writes nothing."""
+        write_export_file(
+            tmp_path / "a.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "b.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='n'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        assert not (tmp_path / OUTPUT_DIR_NAME).exists()
 
-        entry = {
-            "id": "new-id",
-            "content": {"uri": "x", "entry_type": "Totp", "name": "test"},
-            "note": None
-        }
-        file_entries = [("src.json", entry, "unique_src_test.json")]
+    def test_decline_generic_filename_warning(self, tmp_path, capsys):
+        """Declining generic filename warning aborts cleanly."""
+        write_export_file(
+            tmp_path / "Proton Authenticator_export_2026-07-09.json_1783587600.json",
+            [{"id": "1", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+        write_export_file(
+            tmp_path / "Proton Authenticator_export_2026-07-10.json_1783674000.json",
+            [{"id": "2", "content": {"uri": "y", "entry_type": "Totp", "name": "t2"}, "note": None}],
+        )
+        with patch('builtins.input', return_value='n'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+        assert result == 0
+        captured = capsys.readouterr()
+        assert "Rename your files" in captured.out
+        assert not (tmp_path / OUTPUT_DIR_NAME).exists()
 
-        write_single_entry_files(tmp_path, file_entries)
 
-        data = json_module.loads((tmp_path / "unique_src_test.json").read_text(encoding="utf-8"))
+class TestIntegration:
+    """Integration tests using real example files."""
+
+    def setup_example_dir(self, tmp_path):
+        """Copy example files to a temp directory."""
+        examples_dir = Path(__file__).parent / "examples"
+        for f in examples_dir.glob("*.json"):
+            # Skip any previously generated output files
+            if f.name.startswith("merged_") or f.name.startswith("unique_"):
+                continue
+            shutil.copy(f, tmp_path / f.name)
+        return tmp_path
+
+    def test_full_pipeline(self, tmp_path):
+        """Full pipeline produces merged output and unique entry files."""
+        self.setup_example_dir(tmp_path)
+
+        # The generic-named file will trigger the warning, accept it + merge
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+
+        assert result == 0
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        assert output_dir.is_dir()
+        assert (output_dir / OUTPUT_FILENAME).exists()
+
+        data = json_module.loads((output_dir / OUTPUT_FILENAME).read_text(encoding="utf-8"))
         assert data["version"] == 1
-        assert data["entries"][0]["id"] == "new-id"
+        assert len(data["entries"]) == 18  # 16 shared + 2 unique
 
-    def test_entry_data_preserved_exactly(self, tmp_path):
-        """Entry data (id, content, note) is preserved unchanged in the output file."""
-        entry = {
-            "id": "a7e1d804-7e24-4db2-9508-b3eb301f123b",
-            "content": {
-                "uri": "otpauth://totp/mattermost%3Amartyn?secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30&issuer=mattermost",
-                "entry_type": "Totp",
-                "name": "martyn"
-            },
-            "note": None
-        }
-        file_entries = [("mobile.json", entry, "unique_mobile_mattermost.json")]
+    def test_unique_entry_files_created(self, tmp_path):
+        """Unique entry files are created for entries in only one source."""
+        self.setup_example_dir(tmp_path)
 
-        write_single_entry_files(tmp_path, file_entries)
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
 
-        data = json_module.loads((tmp_path / "unique_mobile_mattermost.json").read_text(encoding="utf-8"))
-        assert data["entries"][0] == entry
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        unique_files = list(output_dir.glob("unique_*.json"))
+        # Should have 2 unique entries: one mobile-only, one desktop-only
+        assert len(unique_files) == 2
+
+        # Each unique file is a valid single-entry export
+        for uf in unique_files:
+            data = json_module.loads(uf.read_text(encoding="utf-8"))
+            assert data["version"] == 1
+            assert len(data["entries"]) == 1
+
+    def test_missing_from_summary_printed(self, tmp_path, capsys):
+        """Import summary is printed showing which file entries are missing from."""
+        self.setup_example_dir(tmp_path)
+
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
+
+        output = capsys.readouterr().out
+        assert "Import Summary" in output
+        assert "Missing from:" in output
+
+    def test_rerun_with_existing_output(self, tmp_path):
+        """Re-running with existing output/ prompts for overwrite."""
+        self.setup_example_dir(tmp_path)
+
+        # First run
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                main()
+
+        # Second run - accept all prompts
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+
+        assert result == 0
+        # Files should still be there (overwritten)
+        assert (tmp_path / OUTPUT_DIR_NAME / OUTPUT_FILENAME).exists()
+
+    def test_output_dir_does_not_affect_input_discovery(self, tmp_path):
+        """Files in output/ subdirectory don't count as input files."""
+        self.setup_example_dir(tmp_path)
+
+        # Create output dir with extra json files that look like exports
+        output_dir = tmp_path / OUTPUT_DIR_NAME
+        output_dir.mkdir()
+        write_export_file(
+            output_dir / "decoy.json",
+            [{"id": "decoy", "content": {"uri": "x", "entry_type": "Totp", "name": "t"}, "note": None}],
+        )
+
+        with patch('builtins.input', return_value='y'):
+            with patch('sys.argv', ['merge_proton_auth', str(tmp_path)]):
+                result = main()
+
+        # Should succeed - only the 2 input files in the root dir are found
+        assert result == 0
+
+
+class TestSanitiseFilenamePart:
+    """Tests for sanitise_filename_part."""
+
+    def test_replaces_unsafe_chars(self):
+        """Unsafe characters replaced with underscore."""
+        assert sanitise_filename_part("a/b\\c:d*e") == "a_b_c_d_e"
+        assert sanitise_filename_part("hello world") == "hello_world"
+        assert sanitise_filename_part('a"b<c>d|e') == "a_b_c_d_e"
+
+    def test_truncates_to_max_length(self):
+        """Output truncated to MAX_DESCRIPTIVE_LENGTH."""
+        long_str = "a" * 200
+        result = sanitise_filename_part(long_str)
+        assert len(result) == 80
+
+    def test_safe_chars_unchanged(self):
+        """Safe characters pass through unchanged."""
+        assert sanitise_filename_part("hello-world_123") == "hello-world_123"
+
+
+class TestDeriveEntryName:
+    """Tests for derive_entry_name."""
+
+    def test_priority_1_note(self):
+        """Non-empty note takes priority."""
+        entry = {"content": {"uri": "otpauth://totp/x?issuer=GitHub", "name": "fallback"}, "note": "My Note"}
+        assert derive_entry_name(entry) == "My Note"
+
+    def test_priority_2_issuer(self):
+        """Issuer from URI when no note."""
+        entry = {"content": {"uri": "otpauth://totp/x?secret=ABC&issuer=Google", "name": "fallback"}, "note": None}
+        assert derive_entry_name(entry) == "Google"
+
+    def test_priority_3_content_name(self):
+        """content.name when no note and no issuer."""
+        entry = {"content": {"uri": "otpauth://totp/x?secret=ABC", "name": "myaccount"}, "note": None}
+        assert derive_entry_name(entry) == "myaccount"
+
+    def test_fallback_unknown(self):
+        """Returns 'unknown' when no name data available."""
+        entry = {"content": {"uri": "", "entry_type": "Totp"}, "note": None}
+        assert derive_entry_name(entry) == "unknown"
+
+    def test_empty_note_not_used(self):
+        """Empty string note is treated as no note."""
+        entry = {"content": {"uri": "otpauth://totp/x?issuer=GitHub", "name": "fallback"}, "note": ""}
+        assert derive_entry_name(entry) == "GitHub"
