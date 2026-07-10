@@ -52,7 +52,13 @@ def parse_args() -> Path:
             "The directory must contain exactly 2 valid Proton Authenticator\n"
             "export files (JSON with version=1 and an entries array).\n"
             "Extra .json files that are not valid exports are ignored.\n"
-            "If more than 2 valid exports are found, the script aborts."
+            "If more than 2 valid exports are found, the script aborts.\n"
+            "\n"
+            "note for WSL users:\n"
+            "  Proton Authenticator on Windows may fail to import files from a\n"
+            "  WSL filesystem path (\"forbidden path\" error). If this happens,\n"
+            "  copy the output files to a Windows filesystem location (e.g.\n"
+            "  /mnt/c/Users/<you>/Desktop/) and import from there."
         ),
     )
     parser.add_argument(
@@ -443,6 +449,12 @@ def print_missing_from_summary(
         f"\nAlternatively, you can clear all entries from your Proton Authenticator\n"
         f"instance and import everything from '{OUTPUT_FILENAME}' which contains\n"
         f"the complete deduplicated set of entries from both sources."
+    )
+    print(
+        "\nNote for WSL users: Proton Authenticator on Windows may fail to import\n"
+        "files from a WSL path (\"forbidden path\" error). Copy the output files to\n"
+        "a Windows filesystem location (e.g. /mnt/c/Users/<you>/Desktop/) and\n"
+        "import from there."
     )
 
 
