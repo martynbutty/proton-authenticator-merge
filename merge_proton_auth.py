@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Merge two Proton Authenticator JSON export files into a deduplicated master file.
+"""Merge two Proton Authenticator JSON export files.
 
-Outputs all files to an 'output/' subdirectory relative to the target directory.
-Also generates individual single-entry import files for entries unique to one source,
-with a summary showing which input file each unique entry is missing from.
+Expects exactly two valid Proton Authenticator export files in the target
+directory. Produces a deduplicated master merge and individual single-entry
+import files for any entries that only exist in one of the two sources.
+
+All output is written to an 'output/' subdirectory (created automatically).
+If output files already exist, the user is prompted before overwriting.
+
+At the end, an import summary is printed showing each single-entry file and
+which input file it is missing from, so the user knows which Proton
+Authenticator instance to import it into.
 """
 
 import argparse
@@ -27,13 +34,32 @@ GENERIC_EXPORT_PATTERN = re.compile(
 def parse_args() -> Path:
     """Parse CLI arguments and return the target directory path."""
     parser = argparse.ArgumentParser(
-        description="Merge two Proton Authenticator JSON export files into a deduplicated master file."
+        description=(
+            "Merge exactly two Proton Authenticator JSON export files. "
+            "Produces a deduplicated master file and individual import files "
+            "for entries unique to one source. All output is written to an "
+            "'output/' subdirectory. If input files have generic export names, "
+            "you will be prompted to consider renaming them with meaningful "
+            "prefixes (e.g. 'mobile_', 'desktop_') so the import summary "
+            "clearly identifies which instance to import each entry into."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  %(prog)s                   Process files in current directory\n"
+            "  %(prog)s ./my_exports      Process files in ./my_exports\n"
+            "\n"
+            "The directory must contain exactly 2 valid Proton Authenticator\n"
+            "export files (JSON with version=1 and an entries array).\n"
+            "Extra .json files that are not valid exports are ignored.\n"
+            "If more than 2 valid exports are found, the script aborts."
+        ),
     )
     parser.add_argument(
         "directory",
         nargs="?",
         default=".",
-        help="Directory containing Proton Authenticator export files (default: current directory)",
+        help="directory containing the two Proton Authenticator export files (default: current directory)",
     )
     args = parser.parse_args()
     return Path(args.directory)
@@ -413,6 +439,11 @@ def print_missing_from_summary(
         print()
 
     print("----------------------")
+    print(
+        f"\nAlternatively, you can clear all entries from your Proton Authenticator\n"
+        f"instance and import everything from '{OUTPUT_FILENAME}' which contains\n"
+        f"the complete deduplicated set of entries from both sources."
+    )
 
 
 def main() -> int:
